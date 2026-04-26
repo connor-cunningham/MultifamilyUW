@@ -229,13 +229,52 @@ if df is not None and not df.empty:
                 st.success("Saved to pipeline!")
 
 else:
-    st.info("👆 Click **Run Scraper & Underwrite All** to fetch and analyze listings.")
+    st.info("👆 Click **Run Scraper & Underwrite All** to fetch listings, or paste one manually below.")
+
+    st.markdown("---")
+    st.subheader("📋 Paste a Listing Manually")
+    st.caption("Found a deal on Crexi, Zillow, Redfin, or LoopNet? Enter the details here and underwrite it instantly.")
+
+    with st.form("manual_entry"):
+        col1, col2, col3 = st.columns(3)
+        m_address = col1.text_input("Address", placeholder="123 Main St")
+        m_city = col2.text_input("City", placeholder="Phoenix")
+        m_state = col3.text_input("State", placeholder="AZ", max_chars=2)
+        col4, col5, col6 = st.columns(3)
+        m_units = col4.number_input("Units", min_value=1, max_value=50, value=4)
+        m_price = col5.number_input("Asking Price ($)", min_value=50_000, max_value=10_000_000,
+                                     value=900_000, step=25_000)
+        m_rent = col6.number_input("Monthly Rent Total ($, 0 if unknown)", min_value=0,
+                                    max_value=100_000, value=0, step=100)
+        col7, col8 = st.columns(2)
+        m_year = col7.number_input("Year Built", min_value=1900, max_value=2024, value=1985)
+        m_url = col8.text_input("Listing URL (optional)", placeholder="https://crexi.com/...")
+
+        submitted = st.form_submit_button("⚡ Underwrite This Deal", type="primary", use_container_width=True)
+
+    if submitted and m_address:
+        from models.property import Property
+        from datetime import datetime
+        manual_prop = Property(
+            address=m_address, city=m_city, state=m_state.upper() or "CA",
+            units=int(m_units), purchase_price=float(m_price),
+            monthly_rent_total=float(m_rent) if m_rent else None,
+            year_built=int(m_year), listing_url=m_url or "", source="manual",
+            scraped_at=datetime.utcnow(),
+        )
+        st.session_state.selected_prop = manual_prop
+        st.switch_page("pages/2_Underwrite.py")
+
+    st.markdown("---")
     st.markdown("""
-    **How it works:**
+    **How the scraper works:**
     1. Select your target states and filters in the sidebar
-    2. Click Run Scraper to pull active listings
+    2. Click Run Scraper — it opens a real browser in the background to pull live listings
     3. Every listing is automatically underwritten using institutional PE assumptions
     4. Click any row to deep-dive, generate Excel, or save to your deal tracker
 
     **Default financing:** 7/1 IO ARM · 5.75% · 75% LTV (Ascent US Bank terms)
+
+    > **Note:** Crexi and Zillow occasionally block automated browsers. If the scraper returns 0 results,
+    > use Mock Data to test the tool, or paste listings manually using the form above.
     """)
