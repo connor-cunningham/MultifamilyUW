@@ -16,6 +16,20 @@ st.caption("All underwritten deals — track decisions and performance")
 init_db()
 
 
+def _grade_from_score(score) -> str:
+    if score is None or pd.isna(score):
+        return "—"
+    if score >= 8.0:
+        return "A"
+    if score >= 6.0:
+        return "B"
+    if score >= 4.0:
+        return "C"
+    if score >= 2.0:
+        return "D"
+    return "F"
+
+
 def load_deals(filters: dict) -> pd.DataFrame:
     session = get_session()
     q = session.query(Deal)
@@ -43,6 +57,7 @@ with st.sidebar.expander("🔍 Filters", expanded=True):
     filter_states = st.multiselect("State", WESTERN_US_STATES)
     filter_status = st.multiselect("Status", ["pipeline", "underwritten", "pursuing", "pass", "closed"])
     filter_decision = st.multiselect("Decision", ["buy", "pass", "watch"])
+    filter_grades = st.multiselect("AI Grade", ["A", "B", "C", "D", "F"])
 
 filters = {
     "states": filter_states or None,
@@ -55,35 +70,104 @@ df = load_deals(filters)
 if df.empty:
     st.info("No deals in tracker yet. Run the scraper and underwrite some properties first!")
 else:
+    # Apply grade filter client-side (derived field)
+    if "ai_score" in df.columns:
+        df["_grade"] = df["ai_score"].apply(_grade_from_score)
+    else:
+        df["_grade"] = "—"
+
+    if filter_grades:
+        df = df[df["_grade"].isin(filter_grades)]
+        if df.empty:
+            st.info("No deals match the selected grade filter.")
+            st.stop()
+
     # ── Summary KPIs ────────────────────────────────────────────────────
     total = len(df)
-    pursuing = (df["status"] == "pursuing").sum()
-    passed = (df["decision"] == "pass").sum()
-    watching = (df["decision"] == "watch").sum()
+    pursuing = (df["status"] == "pursuing").sum() if "status" in df else 0
+    passed = (df["decision"] == "pass").sum() if "decision" in df else 0
+    watching = (df["decision"] == "watch").sum() if "decision" in df else 0
 
-    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
     k1.metric("Total Deals", total)
-    k2.metric("Pursuing", pursuing)
-    k3.metric("Passed", passed)
-    k4.metric("Watching", watching)
-    avg_coc = df["coc_y1"].dropna().mean()
-    avg_irr = df["irr_5yr"].dropna().mean()
-    k5.metric("Avg CoC Y1", f"{avg_coc:.1%}" if not pd.isna(avg_coc) else "—")
-    k6.metric("Avg 5yr IRR", f"{avg_irr:.1%}" if not pd.isna(avg_irr) else "—")
+    k2.metric("Pursuing", int(pursuing))
+    k3.metric("Passed", int(passed))
+    k4.metric("Watching", int(watching))
+    avg_score = df["ai_score"].dropna().mean() if "ai_score" in df else None
+    avg_coc = df["coc_y1"].dropna().mean() if "coc_y1" in df else None
+    avg_irr = df["irr_5yr"].dropna().mean() if "irr_5yr" in df else None
+    k5.metric("Avg Score", f"{avg_score:.1f}/10" if avg_score and not pd.isna(avg_score) else "—")
+    k6.metric("Avg CoC Y1", f"{avg_coc:.1%}" if avg_coc and not pd.isna(avg_coc) else "—")
+    k7.metric("Avg 5yr IRR", f"{avg_irr:.1%}" if avg_irr and not pd.isna(avg_irr) else "—")
+
+    # ── Deal Funnel Chart ─────────────────────────────────────────────────
+    with st.expander("📊 Deal Funnel & Charts", expanded=False):
+        try:
+            import altair as alt
+
+            ch1, ch2 = st.columns(2)
+
+            with ch1:
+                st.markdown("**Deal Funnel by Status**")
+                if "status" in df:
+                    funnel_counts = df["status"].value_counts().reset_index()
+                    funnel_counts.columns = ["Status", "Count"]
+                    status_order = ["pipeline", "underwritten", "pursuing", "pass", "closed"]
+                    funnel_counts["Status"] = pd.Categorical(funnel_counts["Status"],
+                                                              categories=status_order, ordered=True)
+                    funnel_counts = funnel_counts.sort_values("Status")
+                    funnel_chart = alt.Chart(funnel_counts).mark_bar().encode(
+                        x=alt.X("Count:Q"),
+                        y=alt.Y("Status:N", sort=status_order),
+                        color=alt.Color("Status:N", scale=alt.Scale(
+                            domain=status_order,
+                            range=["#94a3b8", "#60a5fa", "#22c55e", "#ef4444", "#a855f7"]
+                        ), legend=None),
+                        tooltip=["Status", "Count"],
+                    ).properties(height=200)
+                    st.altair_chart(funnel_chart, use_container_width=True)
+
+            with ch2:
+                st.markdown("**Score Distribution**")
+                if "ai_score" in df and df["ai_score"].notna().any():
+                    score_df = df[df["ai_score"].notna()].copy()
+                    score_chart = alt.Chart(score_df).mark_bar().encode(
+                        x=alt.X("ai_score:Q", bin=alt.Bin(step=1.0), title="AI Score"),
+                        y="count()",
+                        color=alt.condition(
+                            alt.datum.ai_score >= 7.5,
+                            alt.value("#22c55e"),
+                            alt.condition(
+                                alt.datum.ai_score >= 5.0,
+                                alt.value("#f59e0b"),
+                                alt.value("#ef4444")
+                            )
+                        ),
+                        tooltip=["count()"],
+                    ).properties(title="Score Distribution", height=200)
+                    st.altair_chart(score_chart, use_container_width=True)
+
+        except ImportError:
+            st.info("Install altair for charts: pip install altair")
 
     st.markdown("---")
 
     # ── Deal table ───────────────────────────────────────────────────────
     display_cols = {
-        "address": "Address", "city": "City", "state": "State", "units": "Units",
-        "purchase_price": "Price", "going_in_cap_rate": "Cap Rate",
+        "ai_score": "Score", "address": "Address", "city": "City", "state": "State",
+        "units": "Units", "purchase_price": "Price", "going_in_cap_rate": "Cap Rate",
         "coc_y1": "CoC Y1", "dscr_y1": "DSCR", "irr_5yr": "5yr IRR",
-        "irr_10yr": "10yr IRR", "equity_multiple_5yr": "EM 5yr",
-        "status": "Status", "decision": "Decision", "underwritten_at": "Underwritten",
+        "equity_multiple_5yr": "EM 5yr", "status": "Status", "decision": "Decision",
+        "underwritten_at": "Underwritten",
     }
-    show_df = df[[c for c in display_cols.keys() if c in df.columns]].copy()
+    available = [c for c in display_cols.keys() if c in df.columns]
+    show_df = df[available].copy()
     show_df = show_df.rename(columns=display_cols)
 
+    if "Score" in show_df:
+        show_df["Score"] = show_df["Score"].apply(
+            lambda x: f"{x:.1f}" if pd.notna(x) else "—"
+        )
     if "Price" in show_df:
         show_df["Price"] = show_df["Price"].apply(lambda x: f"${x:,.0f}" if pd.notna(x) else "—")
     if "Cap Rate" in show_df:
@@ -94,8 +178,6 @@ else:
         show_df["DSCR"] = show_df["DSCR"].apply(lambda x: f"{x:.2f}x" if pd.notna(x) else "—")
     if "5yr IRR" in show_df:
         show_df["5yr IRR"] = show_df["5yr IRR"].apply(lambda x: f"{x:.1%}" if pd.notna(x) else "—")
-    if "10yr IRR" in show_df:
-        show_df["10yr IRR"] = show_df["10yr IRR"].apply(lambda x: f"{x:.1%}" if pd.notna(x) else "—")
     if "EM 5yr" in show_df:
         show_df["EM 5yr"] = show_df["EM 5yr"].apply(lambda x: f"{x:.2f}x" if pd.notna(x) else "—")
     if "Underwritten" in show_df:
@@ -116,6 +198,24 @@ else:
 
         st.markdown("---")
         st.subheader(f"📋 {row.get('address', '')}, {row.get('city', '')}, {row.get('state', '')}")
+
+        # Score badge
+        score_val = row.get("ai_score")
+        if score_val and not pd.isna(score_val):
+            score_val = float(score_val)
+            sc_color = "#22c55e" if score_val >= 7.5 else "#f59e0b" if score_val >= 5.0 else "#ef4444"
+            grade_str = _grade_from_score(score_val)
+            st.markdown(
+                f'<span style="background:{sc_color};color:white;padding:3px 12px;'
+                f'border-radius:5px;font-weight:bold">Score: {score_val:.1f}/10 &nbsp;|&nbsp; Grade: {grade_str}</span>',
+                unsafe_allow_html=True,
+            )
+            st.write("")
+
+        # AI memo if available
+        ai_memo = row.get("ai_memo")
+        if ai_memo:
+            st.markdown(f"**AI Memo:** {ai_memo}")
 
         with st.expander("📝 Notes & Decision", expanded=True):
             col1, col2, col3 = st.columns(3)
@@ -172,7 +272,8 @@ else:
 
     # ── Export ───────────────────────────────────────────────────────────
     st.markdown("---")
-    csv = df[[c for c in display_cols.keys() if c in df.columns]].to_csv(index=False)
+    export_cols = [c for c in display_cols.keys() if c in df.columns]
+    csv = df[export_cols].to_csv(index=False)
     st.download_button(
         "⬇️ Export All Deals as CSV",
         data=csv,

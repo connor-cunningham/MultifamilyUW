@@ -13,6 +13,7 @@ from models.underwriting import UWAssumptions
 from models.database import get_session, upsert_deal
 from underwriting.engine import underwrite
 from underwriting.assumptions import get_default_assumptions, assumptions_from_dict
+from underwriting.scoring import score_deal
 from excel.generator import generate_excel
 
 st.set_page_config(page_title="Underwrite Deal", page_icon="📊", layout="wide")
@@ -136,29 +137,41 @@ elif results:
     st.markdown("---")
     st.subheader("📈 Results")
 
-    # ── Key Metrics ──
-    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    quant_score = score_deal(results, working_prop)
+    score_color = "#22c55e" if quant_score >= 7.5 else "#f59e0b" if quant_score >= 5.0 else "#ef4444"
+    st.markdown(
+        f'<span style="background:{score_color};color:white;padding:4px 14px;'
+        f'border-radius:6px;font-size:18px;font-weight:bold">Score: {quant_score:.1f}/10</span>',
+        unsafe_allow_html=True,
+    )
+    st.write("")
+
     def _pct(v): return f"{v:.1%}" if v is not None else "—"
     def _dol(v): return f"${v:,.0f}" if v is not None else "—"
 
-    cap_color = "normal" if results.going_in_cap_rate >= 0.06 else "inverse"
-    coc_color = "normal" if results.coc_y1 >= 0.07 else "inverse"
-    dscr_color = "normal" if results.dscr_y1 >= 1.25 else "inverse"
-    irr_color = "normal" if (results.irr_5yr or 0) >= 0.12 else "inverse"
-
-    k1.metric("Cap Rate", _pct(results.going_in_cap_rate), delta="vs 6% target" if results.going_in_cap_rate < 0.06 else None)
+    # ── Row 1: Core return metrics ──
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1.metric("Cap Rate", _pct(results.going_in_cap_rate))
     k2.metric("Cash-on-Cash Y1", _pct(results.coc_y1))
     k3.metric("DSCR Y1", f"{results.dscr_y1:.2f}x")
     k4.metric("NOI (Year 1)", _dol(results.noi))
     k5.metric("5yr IRR", _pct(results.irr_5yr))
     k6.metric("10yr IRR", _pct(results.irr_10yr))
 
-    # ── Returns table ──
+    # ── Row 2: Advanced metrics ──
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Debt Yield", _pct(results.debt_yield))
+    m2.metric("Breakeven Occ", _pct(results.breakeven_occupancy))
+    m3.metric("Unlevered IRR", _pct(results.unlevered_irr))
+    m4.metric("5yr Equity Multiple", f"{results.equity_multiple_5yr:.2f}x" if results.equity_multiple_5yr else "—")
+    m5.metric("Price / Unit", _dol(results.price_per_unit))
+
+    # ── Returns table + cashflow ──
     col_a, col_b = st.columns(2)
     with col_a:
         st.markdown("**Investment Summary**")
         summary_data = {
-            "Metric": ["Purchase Price", "Loan Amount (75% LTV)", "Equity Invested",
+            "Metric": ["Purchase Price", "Loan Amount", "Equity Invested",
                        "Annual IO Debt Service", "NOI Year 1", "Net Cash Flow Y1",
                        "Exit Price (Year 10)", "Equity Multiple 5yr", "Equity Multiple 10yr"],
             "Value": [
@@ -185,9 +198,81 @@ elif results:
             })
         st.dataframe(pd.DataFrame(ym_data), use_container_width=True, hide_index=True)
 
+    # ── Scenario Analysis ─────────────────────────────────────────────────
+    with st.expander("🎭 Scenario Analysis (Base / Bull / Bear / Stress)", expanded=False):
+        try:
+            from underwriting.scenarios import run_scenarios
+            with st.spinner("Running scenarios..."):
+                scenario_map = run_scenarios(working_prop, uw_assumptions)
+
+            sc_rows = []
+            for name, sr in scenario_map.items():
+                sc_score = score_deal(sr, working_prop)
+                sc_rows.append({
+                    "Scenario": name.upper(),
+                    "Cap Rate": _pct(sr.going_in_cap_rate),
+                    "NOI": _dol(sr.noi),
+                    "DSCR": f"{sr.dscr_y1:.2f}x",
+                    "CoC Y1": _pct(sr.coc_y1),
+                    "5yr IRR": _pct(sr.irr_5yr),
+                    "Debt Yield": _pct(sr.debt_yield),
+                    "Score": f"{sc_score:.1f}",
+                })
+            sc_df = pd.DataFrame(sc_rows)
+            st.dataframe(sc_df, use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.warning(f"Scenario error: {e}")
+
     st.markdown("---")
 
-    # ── Actions ──
+    # ── AI Analysis ───────────────────────────────────────────────────────
+    st.subheader("🤖 AI Deal Analysis")
+
+    if "ai_analysis" not in st.session_state:
+        st.session_state.ai_analysis = None
+
+    ai_col1, ai_col2 = st.columns([1, 3])
+    with ai_col1:
+        if st.button("🤖 Run AI Analysis", type="primary", use_container_width=True):
+            with st.spinner("Analyzing deal with Claude..."):
+                try:
+                    from ai.analyzer import analyze_deal
+                    st.session_state.ai_analysis = analyze_deal(working_prop, uw_assumptions, results)
+                except Exception as e:
+                    st.error(f"AI error: {e}")
+
+    analysis = st.session_state.ai_analysis
+    if analysis:
+        grade_color = {"A": "#22c55e", "B": "#84cc16", "C": "#f59e0b", "D": "#f97316"}.get(analysis.grade, "#ef4444")
+        st.markdown(
+            f'<span style="background:{analysis.badge_color};color:white;padding:3px 10px;'
+            f'border-radius:4px;font-weight:bold;font-size:16px">Score {analysis.score:.1f}/10 &nbsp;|&nbsp; '
+            f'Grade {analysis.grade} &nbsp;|&nbsp; {analysis.recommendation}</span>',
+            unsafe_allow_html=True,
+        )
+        st.write("")
+
+        if analysis.memo:
+            st.markdown(f"**Investment Thesis:** {analysis.memo}")
+
+        if analysis.comp_context:
+            st.caption(analysis.comp_context)
+
+        ai_s, ai_r = st.columns(2)
+        with ai_s:
+            if analysis.strengths:
+                st.markdown("**✅ Strengths**")
+                for s in analysis.strengths:
+                    st.markdown(f"- {s}")
+        with ai_r:
+            if analysis.risks:
+                st.markdown("**⚠️ Risks**")
+                for r in analysis.risks:
+                    st.markdown(f"- {r}")
+
+    st.markdown("---")
+
+    # ── Actions ──────────────────────────────────────────────────────────
     col1, col2, col3 = st.columns(3)
 
     with col1:
@@ -208,7 +293,42 @@ elif results:
                 except Exception as e:
                     st.error(f"Excel error: {e}")
 
-    # ── Save Decision ──
+    with col2:
+        settings = load_settings()
+        email_to = settings.get("report_email_to", "")
+        if email_to:
+            if st.button("📧 Email This Report", use_container_width=True):
+                with st.spinner("Sending report..."):
+                    try:
+                        from notifications.email_client import EmailClient
+                        from models.analysis import DealAnalysis, grade_from_score, recommendation_from_score
+
+                        if analysis:
+                            report_analysis = analysis
+                        else:
+                            report_analysis = DealAnalysis(
+                                score=quant_score,
+                                grade=grade_from_score(quant_score),
+                                recommendation=recommendation_from_score(quant_score),
+                                memo="",
+                            )
+
+                        excel_path_str = st.session_state.get("last_excel_path")
+                        excel_attach = Path(excel_path_str) if excel_path_str else None
+
+                        EmailClient().send_deal_report(
+                            email_to, working_prop, results, report_analysis, excel_attach
+                        )
+                        st.success(f"Report sent to {email_to}")
+                    except Exception as e:
+                        st.error(f"Email failed: {e}")
+        else:
+            st.caption("Set report_email_to in Settings to enable email.")
+
+    with col3:
+        pass  # reserved
+
+    # ── Save Decision ─────────────────────────────────────────────────────
     with st.expander("💾 Save Decision to Tracker", expanded=False):
         dec_col1, dec_col2 = st.columns(2)
         decision = dec_col1.radio("Decision", ["buy", "pass", "watch"], horizontal=True)
@@ -220,7 +340,8 @@ elif results:
         if st.button("💾 Save to Deal Tracker", use_container_width=True):
             session = get_session()
             excel_path_str = st.session_state.get("last_excel_path")
-            upsert_deal(session, {
+
+            deal_data = {
                 "address": working_prop.address, "city": working_prop.city,
                 "state": working_prop.state, "zip_code": working_prop.zip_code,
                 "units": working_prop.units, "year_built": working_prop.year_built,
@@ -245,6 +366,19 @@ elif results:
                 "excel_path": excel_path_str,
                 "underwritten_at": datetime.utcnow(),
                 "uw_assumptions_json": uw_assumptions.model_dump(),
-            })
+                "ai_score": quant_score,
+            }
+
+            if analysis:
+                from models.analysis import grade_from_score
+                deal_data.update({
+                    "ai_score": analysis.score,
+                    "ai_grade": analysis.grade,
+                    "ai_memo": analysis.memo,
+                    "ai_risks": analysis.risks,
+                    "ai_strengths": analysis.strengths,
+                })
+
+            upsert_deal(session, deal_data)
             session.close()
             st.success("Deal saved to tracker!")

@@ -10,3 +10,6 @@ pandas>=2.1
 streamlit>=1.30
 python-dotenv>=1.0
 rich>=13.0
+anthropic>=0.40
+apscheduler>=3.10
+altair>=5.0

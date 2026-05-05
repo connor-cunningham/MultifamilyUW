@@ -56,6 +56,13 @@ class Deal(Base):
     equity_multiple_5yr = Column(Float, nullable=True)
     equity_multiple_10yr = Column(Float, nullable=True)
 
+    # AI analysis
+    ai_score = Column(Float, nullable=True)       # 0–10 quantitative score
+    ai_grade = Column(String, nullable=True)      # A/B/C/D/F
+    ai_memo = Column(Text, nullable=True)         # investment thesis paragraph
+    ai_risks = Column(JSON, nullable=True)        # list of risk bullets
+    ai_strengths = Column(JSON, nullable=True)    # list of strength bullets
+
     # Deal tracking
     status = Column(String, default="pipeline")  # pipeline | underwritten | pass | pursuing | closed
     decision = Column(String, nullable=True)      # buy | pass | watch

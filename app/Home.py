@@ -1,4 +1,4 @@
-"""Deal Pipeline — scrape listings and browse candidates."""
+"""Deal Pipeline — scrape listings, underwrite, rank by score."""
 import sys
 from pathlib import Path
 
@@ -12,7 +12,8 @@ from config import WESTERN_US_STATES, load_settings
 from models.database import init_db, get_session, upsert_deal, Deal
 from models.property import Property
 from underwriting.engine import underwrite
-from underwriting.assumptions import get_default_assumptions, assumptions_from_dict
+from underwriting.assumptions import get_default_assumptions
+from underwriting.scoring import score_deal
 
 st.set_page_config(
     page_title="Multifamily Deal Analyzer",
@@ -21,39 +22,40 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Initialize DB
 init_db()
 
+# ── Start background scheduler (if enabled) ─────────────────────────────────
+try:
+    import scheduler as sched_module
+    if sched_module.get_scheduler() is None:
+        sched_module.start_scheduler()
+except Exception:
+    pass
 
-def run_scraper(source: str, states: list[str], min_units: int, max_units: int,
-                max_price: float, max_results: int) -> list[Property]:
+
+def run_scraper(source, states, min_units, max_units, max_price, max_results) -> list[Property]:
     props = []
-
     if source in ("mock", "crexi_mock"):
         from scrapers.mock import MockScraper
-        scraper = MockScraper()
-        for p in scraper.fetch(states, min_units, max_units, max_price, max_results):
-            props.append(p)
-        return props
+        return list(MockScraper().fetch(states, min_units, max_units, max_price, max_results))
 
     if source in ("crexi", "both"):
         try:
             from scrapers.crexi import CrexiScraper
-            for p in CrexiScraper().fetch(states, min_units, max_units, max_price, max_results // 2 if source == "both" else max_results):
-                props.append(p)
+            props += list(CrexiScraper().fetch(states, min_units, max_units, max_price,
+                          max_results // 2 if source == "both" else max_results))
         except Exception as e:
-            st.warning(f"Crexi scraper error: {e}. Falling back to mock data.")
+            st.warning(f"Crexi error: {e}. Falling back to mock.")
             from scrapers.mock import MockScraper
-            for p in MockScraper().fetch(states, min_units, max_units, max_price, 10):
-                props.append(p)
+            props += list(MockScraper().fetch(states, min_units, max_units, max_price, 10))
 
     if source in ("zillow", "both"):
         try:
             from scrapers.zillow import ZillowScraper
-            for p in ZillowScraper().fetch(states, min_units, max_units, max_price, max_results // 2 if source == "both" else max_results):
-                props.append(p)
+            props += list(ZillowScraper().fetch(states, min_units, max_units, max_price,
+                          max_results // 2 if source == "both" else max_results))
         except Exception as e:
-            st.warning(f"Zillow scraper error: {e}.")
+            st.warning(f"Zillow error: {e}.")
 
     return props
 
@@ -63,7 +65,9 @@ def props_to_df(props: list[Property], assumptions) -> pd.DataFrame:
     for p in props:
         try:
             r = underwrite(p, assumptions)
+            score = score_deal(r, p)
             rows.append({
+                "Score": score,
                 "Address": p.address,
                 "City": p.city,
                 "State": p.state,
@@ -75,8 +79,10 @@ def props_to_df(props: list[Property], assumptions) -> pd.DataFrame:
                 "NOI": r.noi,
                 "CoC Y1": r.coc_y1,
                 "DSCR": r.dscr_y1,
+                "Debt Yield": r.debt_yield,
                 "5yr IRR": r.irr_5yr,
                 "10yr IRR": r.irr_10yr,
+                "Breakeven Occ": r.breakeven_occupancy,
                 "Source": p.source,
                 "URL": p.listing_url,
                 "_prop": p,
@@ -87,7 +93,7 @@ def props_to_df(props: list[Property], assumptions) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-# ── Sidebar ────────────────────────────────────────────────────────────────
+# ── Sidebar ──────────────────────────────────────────────────────────────────
 st.sidebar.title("🏢 Multifamily UW")
 st.sidebar.markdown("---")
 
@@ -102,7 +108,7 @@ with st.sidebar.expander("🔍 Search Filters", expanded=True):
         "Data Source",
         ["mock", "both", "crexi", "zillow"],
         format_func=lambda x: {
-            "mock": "Mock Data (instant, no network)",
+            "mock": "Mock Data (instant)",
             "both": "Crexi + Zillow (live)",
             "crexi": "Crexi (live)",
             "zillow": "Zillow (live)",
@@ -110,7 +116,15 @@ with st.sidebar.expander("🔍 Search Filters", expanded=True):
     )
     max_results = st.slider("Max Listings", 10, 100, 25, step=5)
 
-# ── Main ────────────────────────────────────────────────────────────────────
+try:
+    import scheduler as sched_module
+    state = sched_module.get_state()
+    if state.get("last_run"):
+        st.sidebar.caption(f"Last auto-scrape: {state['last_run'][:16]}")
+except Exception:
+    pass
+
+# ── Main ─────────────────────────────────────────────────────────────────────
 st.title("🏢 Multifamily Deal Pipeline")
 st.caption(f"Western US | 3–10 Units | ≤${max_price:,.0f} | Source: {source.upper()}")
 
@@ -141,34 +155,54 @@ df = st.session_state.pipeline_df
 if df is not None and not df.empty:
     st.markdown("---")
 
-    # Sort + rank
-    sort_col = st.selectbox("Sort by", ["Cap Rate", "CoC Y1", "5yr IRR", "DSCR", "Price/Unit"], index=0)
+    sort_col = st.selectbox("Sort by", ["Score", "Cap Rate", "CoC Y1", "5yr IRR", "DSCR", "Price/Unit"], index=0)
     df_sorted = df.sort_values(sort_col, ascending=False).reset_index(drop=True)
 
-    display_cols = ["Address", "City", "State", "Units", "Price", "Price/Unit",
-                    "Rent/Unit/Mo", "Cap Rate", "CoC Y1", "DSCR", "5yr IRR", "Source"]
-    display_df = df_sorted[display_cols].copy()
+    # ── KPI summary ──────────────────────────────────────────────────────────
+    st.subheader(f"📊 {len(df_sorted)} Properties Found")
+    k1, k2, k3, k4, k5 = st.columns(5)
+    k1.metric("Avg Score", f"{df['Score'].mean():.1f}/10")
+    k2.metric("Avg Cap Rate", f"{df['Cap Rate'].mean():.1%}")
+    k3.metric("Avg CoC Y1", f"{df['CoC Y1'].mean():.1%}")
+    k4.metric("Avg DSCR", f"{df['DSCR'].mean():.2f}x")
+    k5.metric("Avg 5yr IRR", f"{df['5yr IRR'].mean():.1%}" if df["5yr IRR"].notna().any() else "—")
 
-    # Format
+    # ── Charts ───────────────────────────────────────────────────────────────
+    with st.expander("📈 Charts", expanded=False):
+        try:
+            import altair as alt
+            ch1, ch2 = st.columns(2)
+            with ch1:
+                cap_chart = alt.Chart(df_sorted).mark_bar().encode(
+                    x=alt.X("Cap Rate:Q", bin=alt.Bin(maxbins=10), title="Cap Rate"),
+                    y="count()",
+                    color=alt.value("#1F3864"),
+                ).properties(title="Cap Rate Distribution", height=200)
+                st.altair_chart(cap_chart, use_container_width=True)
+            with ch2:
+                scatter = alt.Chart(df_sorted.dropna(subset=["5yr IRR"])).mark_circle(size=60).encode(
+                    x=alt.X("Price:Q", title="Price ($)"),
+                    y=alt.Y("5yr IRR:Q", title="5yr IRR"),
+                    color=alt.Color("Score:Q", scale=alt.Scale(scheme="redyellowgreen")),
+                    tooltip=["Address", "City", "State", "Score", "Cap Rate", "5yr IRR"],
+                ).properties(title="Price vs 5yr IRR", height=200)
+                st.altair_chart(scatter, use_container_width=True)
+        except ImportError:
+            st.info("Install altair for charts: pip install altair")
+
+    st.markdown("---")
+
+    # ── Display table ────────────────────────────────────────────────────────
+    display_cols = ["Score", "Address", "City", "State", "Units", "Price", "Price/Unit",
+                    "Cap Rate", "CoC Y1", "DSCR", "5yr IRR", "Source"]
+    display_df = df_sorted[display_cols].copy()
     display_df["Price"] = display_df["Price"].apply(lambda x: f"${x:,.0f}" if pd.notna(x) else "—")
     display_df["Price/Unit"] = display_df["Price/Unit"].apply(lambda x: f"${x:,.0f}" if pd.notna(x) else "—")
-    display_df["Rent/Unit/Mo"] = display_df["Rent/Unit/Mo"].apply(lambda x: f"${x:,.0f}" if pd.notna(x) else "—")
     display_df["Cap Rate"] = display_df["Cap Rate"].apply(lambda x: f"{x:.1%}" if pd.notna(x) else "—")
     display_df["CoC Y1"] = display_df["CoC Y1"].apply(lambda x: f"{x:.1%}" if pd.notna(x) else "—")
     display_df["DSCR"] = display_df["DSCR"].apply(lambda x: f"{x:.2f}x" if pd.notna(x) else "—")
     display_df["5yr IRR"] = display_df["5yr IRR"].apply(lambda x: f"{x:.1%}" if pd.notna(x) else "—")
 
-    # Summary KPIs
-    st.subheader(f"📊 {len(df_sorted)} Properties Found")
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Avg Cap Rate", f"{df['Cap Rate'].mean():.1%}")
-    k2.metric("Avg CoC Y1", f"{df['CoC Y1'].mean():.1%}")
-    k3.metric("Avg DSCR", f"{df['DSCR'].mean():.2f}x")
-    k4.metric("Avg 5yr IRR", f"{df['5yr IRR'].mean():.1%}" if df["5yr IRR"].notna().any() else "—")
-
-    st.markdown("---")
-
-    # Table with row selection
     event = st.dataframe(
         display_df,
         use_container_width=True,
@@ -183,17 +217,27 @@ if df is not None and not df.empty:
         selected = df_sorted.iloc[idx]
         prop: Property = selected["_prop"]
         results = selected["_results"]
+        score_val = float(selected["Score"])
 
         st.markdown("---")
         st.subheader(f"📋 Quick View: {prop.address}, {prop.city}, {prop.state}")
 
-        col_a, col_b, col_c, col_d = st.columns(4)
+        score_color = "#22c55e" if score_val >= 7.5 else "#f59e0b" if score_val >= 5.0 else "#ef4444"
+        st.markdown(
+            f'<span style="background:{score_color};color:white;padding:4px 12px;'
+            f'border-radius:6px;font-size:18px;font-weight:bold">Score: {score_val:.1f}/10</span>',
+            unsafe_allow_html=True,
+        )
+        st.write("")
+
+        col_a, col_b, col_c, col_d, col_e = st.columns(5)
         col_a.metric("Cap Rate", f"{results.going_in_cap_rate:.1%}")
         col_b.metric("CoC Year 1", f"{results.coc_y1:.1%}")
         col_c.metric("DSCR Year 1", f"{results.dscr_y1:.2f}x")
         col_d.metric("5yr IRR", f"{results.irr_5yr:.1%}" if results.irr_5yr else "—")
+        col_e.metric("Debt Yield", f"{results.debt_yield:.1%}" if results.debt_yield else "—")
 
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
         with c1:
             if st.button("📊 Full Underwrite This Deal", type="primary", use_container_width=True):
                 st.session_state.selected_prop = prop
@@ -201,7 +245,6 @@ if df is not None and not df.empty:
                 st.switch_page("pages/2_Underwrite.py")
 
         with c2:
-            # Quick save to DB
             if st.button("💾 Save to Pipeline", use_container_width=True):
                 session = get_session()
                 upsert_deal(session, {
@@ -224,16 +267,35 @@ if df is not None and not df.empty:
                     "equity_multiple_10yr": results.equity_multiple_10yr,
                     "vacancy_rate": assumptions.vacancy_rate,
                     "uw_assumptions_json": assumptions.model_dump(),
+                    "ai_score": score_val,
                 })
                 session.close()
                 st.success("Saved to pipeline!")
 
+        with c3:
+            settings = load_settings()
+            email_to = settings.get("report_email_to", "")
+            if email_to:
+                if st.button("📧 Email This Deal", use_container_width=True):
+                    try:
+                        from notifications.email_client import EmailClient
+                        from models.analysis import DealAnalysis, grade_from_score, recommendation_from_score
+                        analysis = DealAnalysis(
+                            score=score_val,
+                            grade=grade_from_score(score_val),
+                            recommendation=recommendation_from_score(score_val),
+                            memo="",
+                        )
+                        EmailClient().send_deal_report(email_to, prop, results, analysis)
+                        st.success(f"Sent to {email_to}")
+                    except Exception as e:
+                        st.error(f"Email failed: {e}")
+
 else:
     st.info("👆 Click **Run Scraper & Underwrite All** to fetch listings, or paste one manually below.")
-
     st.markdown("---")
     st.subheader("📋 Paste a Listing Manually")
-    st.caption("Found a deal on Crexi, Zillow, Redfin, or LoopNet? Enter the details here and underwrite it instantly.")
+    st.caption("Found a deal on Crexi, Zillow, Redfin, or LoopNet? Enter the details and underwrite instantly.")
 
     with st.form("manual_entry"):
         col1, col2, col3 = st.columns(3)
@@ -248,13 +310,10 @@ else:
                                     max_value=100_000, value=0, step=100)
         col7, col8 = st.columns(2)
         m_year = col7.number_input("Year Built", min_value=1900, max_value=2024, value=1985)
-        m_url = col8.text_input("Listing URL (optional)", placeholder="https://crexi.com/...")
-
+        m_url = col8.text_input("Listing URL (optional)")
         submitted = st.form_submit_button("⚡ Underwrite This Deal", type="primary", use_container_width=True)
 
     if submitted and m_address:
-        from models.property import Property
-        from datetime import datetime
         manual_prop = Property(
             address=m_address, city=m_city, state=m_state.upper() or "CA",
             units=int(m_units), purchase_price=float(m_price),
@@ -267,14 +326,15 @@ else:
 
     st.markdown("---")
     st.markdown("""
-    **How the scraper works:**
-    1. Select your target states and filters in the sidebar
-    2. Click Run Scraper — it opens a real browser in the background to pull live listings
-    3. Every listing is automatically underwritten using institutional PE assumptions
-    4. Click any row to deep-dive, generate Excel, or save to your deal tracker
+**How the scraper works:**
+1. Select your target states and filters in the sidebar
+2. Click Run Scraper — it opens a real browser to pull live listings
+3. Every listing is automatically underwritten using institutional PE assumptions
+4. Deals are scored 0–10 across cap rate, DSCR, IRR, CoC, and price/unit
+5. Click any row to deep-dive, run AI analysis, generate Excel, or save to your tracker
 
-    **Default financing:** 7/1 IO ARM · 5.75% · 75% LTV (Ascent US Bank terms)
+**Default financing:** 7/1 IO ARM · 5.75% · 75% LTV (Ascent US Bank terms)
 
-    > **Note:** Crexi and Zillow occasionally block automated browsers. If the scraper returns 0 results,
-    > use Mock Data to test the tool, or paste listings manually using the form above.
+> **Note:** Crexi and Zillow occasionally block automated browsers. If the scraper returns 0 results,
+> use Mock Data to test the tool, or paste listings manually using the form above.
     """)
