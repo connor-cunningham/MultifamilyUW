@@ -1,0 +1,23 @@
+version: "3.9"
+
+services:
+  app:
+    build: .
+    ports:
+      - "8501:8501"
+    volumes:
+      # Persistent data: database, outputs, settings
+      - ./data:/data
+    environment:
+      - DB_PATH=/data/deals.db
+      - OUTPUTS_DIR=/data/outputs
+      - SETTINGS_PATH=/data/settings.json
+    env_file:
+      # Copy .env.example -> .env and fill in your keys
+      - .env
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

@@ -1,12 +1,15 @@
 from pathlib import Path
 import json
+import os
 
 BASE_DIR = Path(__file__).parent
-OUTPUTS_DIR = BASE_DIR / "outputs"
-OUTPUTS_DIR.mkdir(exist_ok=True)
 
-DB_PATH = BASE_DIR / "deals.db"
-SETTINGS_PATH = BASE_DIR / "settings.json"
+# Cloud deployments override these via environment variables so data lands on
+# a persistent volume instead of the ephemeral container filesystem.
+DB_PATH = Path(os.environ.get("DB_PATH", str(BASE_DIR / "deals.db")))
+SETTINGS_PATH = Path(os.environ.get("SETTINGS_PATH", str(BASE_DIR / "settings.json")))
+OUTPUTS_DIR = Path(os.environ.get("OUTPUTS_DIR", str(BASE_DIR / "outputs")))
+OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 
 WESTERN_US_STATES = [
     "CA", "OR", "WA", "NV", "AZ", "CO", "UT", "ID", "MT", "WY", "NM", "AK", "HI"

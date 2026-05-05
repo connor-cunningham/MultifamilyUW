@@ -1,0 +1,13 @@
+.git
+.env
+.env.*
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+deals.db
+outputs/
+settings.json
+*.log
+scheduler_state.json
