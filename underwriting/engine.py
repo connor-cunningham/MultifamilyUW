@@ -10,6 +10,44 @@ from underwriting.cashflow import (
 )
 
 
+def _compute_unlevered_irr(prop, assumptions, yearly_metrics, hold_years) -> float | None:
+    """IRR using NOI (pre-debt) cash flows — measures asset-level return."""
+    from underwriting.cashflow import _exit_proceeds
+    pp = prop.purchase_price
+    # Year-0 = full purchase price (unlevered)
+    flows = [-pp * (1 + assumptions.closing_cost_pct)]
+    for yr in range(1, hold_years + 1):
+        noi = yearly_metrics[yr - 1].noi
+        if yr == hold_years:
+            ep, _, _ = _exit_proceeds(prop, assumptions, yearly_metrics, hold_years)
+            flows.append(noi + ep * (1 - assumptions.transaction_cost_pct))
+        else:
+            flows.append(noi)
+    return compute_irr(flows)
+
+
+def _compute_breakeven_occupancy(y1) -> float | None:
+    """Occupancy at which NOI = debt service (DSCR = 1.0x)."""
+    if not y1.gpr or not y1.debt_service:
+        return None
+    # NOI = EGI_adjusted - OpEx = GPR*(1-occ)*adj - opex = DS
+    # Simplified: (gpr * occ_eff - mgmt_adj) - opex_fixed = ds
+    # Use: required_egi = opex + ds; required_occ = required_egi / gpr
+    opex_ex_mgmt = (y1.total_opex - y1.mgmt)
+    mgmt_rate = y1.mgmt / y1.effective_egi if y1.effective_egi else 0.0
+    # required_total_egi * (1 - mgmt_rate) = opex_ex_mgmt + ds
+    required_egi = (opex_ex_mgmt + y1.debt_service) / (1 - mgmt_rate) if mgmt_rate < 1 else None
+    if required_egi is None:
+        return None
+    # effective_egi = gpr * occ + other; other income assumed constant
+    other = y1.other_income
+    required_gpr_portion = required_egi - other
+    occ = required_gpr_portion / y1.gpr if y1.gpr else None
+    if occ is None or occ < 0:
+        return None
+    return round(min(occ, 1.0), 4)
+
+
 def underwrite(prop: Property, assumptions: UWAssumptions) -> UWResults:
     yearly = build_yearly_metrics(prop, assumptions)
     y1 = yearly[0]
@@ -32,6 +70,10 @@ def underwrite(prop: Property, assumptions: UWAssumptions) -> UWResults:
     em10 = compute_equity_multiple(cf10)
 
     exit_price, exit_cap, _ = _exit_proceeds(prop, assumptions, yearly, hold10)
+
+    debt_yield = round(y1.noi / loan, 4) if loan else None
+    unlevered_irr = _compute_unlevered_irr(prop, assumptions, yearly, hold10)
+    breakeven_occ = _compute_breakeven_occupancy(y1)
 
     return UWResults(
         gpr=y1.gpr,
@@ -65,4 +107,7 @@ def underwrite(prop: Property, assumptions: UWAssumptions) -> UWResults:
         yearly_metrics=[m.model_dump() for m in yearly],
         exit_price=round(exit_price, 2),
         exit_cap_rate=round(exit_cap, 6),
+        debt_yield=debt_yield,
+        unlevered_irr=unlevered_irr,
+        breakeven_occupancy=breakeven_occ,
     )

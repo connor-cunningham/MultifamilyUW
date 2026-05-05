@@ -95,3 +95,8 @@ class UWResults(BaseModel):
     # Exit
     exit_price: float
     exit_cap_rate: float
+
+    # Extended metrics (v2)
+    debt_yield: Optional[float] = None          # NOI / loan amount (lender metric, target >8%)
+    unlevered_irr: Optional[float] = None       # IRR on NOI cash flows without debt
+    breakeven_occupancy: Optional[float] = None # occupancy at which DSCR = 1.0x
